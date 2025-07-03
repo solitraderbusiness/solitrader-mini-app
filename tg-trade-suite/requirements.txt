@@ -1,0 +1,5 @@
+python-dotenv
+python-telegram-bot==21.*
+fastapi>=0.111
+uvicorn
+asyncpg

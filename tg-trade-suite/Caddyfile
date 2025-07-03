@@ -1,0 +1,7 @@
+:8443
+root * /srv
+handle_path /tutorials/* {
+    root * /srv/tutorials
+    file_server
+}
+file_server
