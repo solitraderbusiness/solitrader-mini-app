@@ -1,0 +1,3 @@
+# solitrader-mini-app
+
+START
