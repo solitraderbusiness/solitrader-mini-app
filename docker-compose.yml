@@ -1,40 +1,30 @@
-version: '3.8'
+version: "3.9"
 
 services:
-  # Redis - Lightweight configuration
+  # ────────── Redis ──────────
   redis:
     image: redis:7-alpine
     container_name: tg_trade_redis
-    ports:
-      - "6379:6379"
+    restart: unless-stopped
     volumes:
       - redis_data:/data
-    restart: unless-stopped
-    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
-    deploy:
-      resources:
-        limits:
-          memory: 128M
-          cpus: '0.25'
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 30s
       timeout: 5s
-      retries: 3
+      retries: 5
 
-  # FastAPI Backend - Using external DigitalOcean database
+  # ────────── FastAPI back-end ──────────
   api:
     build: .
     container_name: tg_trade_api
-    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 1
-    ports:
-      - "8000:8000"
+    command: python -m api.main
     depends_on:
       redis:
         condition: service_healthy
     environment:
       - REDIS_URL=redis://redis:6379/0
-      # Image cleanup - delete immediately after analysis
+      - FINNHUB_API_KEY=${FINNHUB_API_KEY}      # ← NEW (optional but handy)
       - IMAGE_CLEANUP_ENABLED=true
       - IMAGE_CLEANUP_DELAY_SECONDS=60
     volumes:
@@ -45,12 +35,12 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1200M  # More RAM since no local DB
-          cpus: '1.25'
+          memory: 1200M
+          cpus: "1.25"
     env_file:
       - .env
 
-  # Telegram Bot - Lightweight
+  # ────────── Telegram Bot ──────────
   bot:
     build: .
     container_name: tg_trade_bot
@@ -60,6 +50,7 @@ services:
         condition: service_healthy
     environment:
       - REDIS_URL=redis://redis:6379/0
+      - FINNHUB_API_KEY=${FINNHUB_API_KEY}      # ← NEW (required by data_fetcher.py)
     volumes:
       - ./uploads:/app/uploads
       - ./logs:/app/logs
@@ -69,14 +60,14 @@ services:
       resources:
         limits:
           memory: 600M
-          cpus: '0.75'
+          cpus: "0.75"
     env_file:
       - .env
 
 volumes:
   redis_data:
-    driver: local
 
 networks:
   default:
     driver: bridge
+
