@@ -1,0 +1,82 @@
+version: '3.8'
+
+services:
+  # Redis - Lightweight configuration
+  redis:
+    image: redis:7-alpine
+    container_name: tg_trade_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.25'
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # FastAPI Backend - Using external DigitalOcean database
+  api:
+    build: .
+    container_name: tg_trade_api
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 1
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      # Image cleanup - delete immediately after analysis
+      - IMAGE_CLEANUP_ENABLED=true
+      - IMAGE_CLEANUP_DELAY_SECONDS=60
+    volumes:
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+      - .:/app
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1200M  # More RAM since no local DB
+          cpus: '1.25'
+    env_file:
+      - .env
+
+  # Telegram Bot - Lightweight
+  bot:
+    build: .
+    container_name: tg_trade_bot
+    command: python -m bot.main
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+      - .:/app
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 600M
+          cpus: '0.75'
+    env_file:
+      - .env
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  default:
+    driver: bridge
