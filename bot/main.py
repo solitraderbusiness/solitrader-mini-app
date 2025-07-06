@@ -4,6 +4,8 @@ TG-Trade Suite Telegram Bot - Enhanced with Chart Analysis
 
 from __future__ import annotations
 
+
+import utils.logger
 import asyncio
 import logging
 import os

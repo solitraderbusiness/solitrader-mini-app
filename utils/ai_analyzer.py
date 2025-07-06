@@ -6,7 +6,7 @@ import logging
 import base64
 import asyncio
 import os
-from typing import Dict, Any, Optional
+from typing import Union, Dict, Any, Optional
 from datetime import datetime
 import httpx
 from openai import AsyncOpenAI
@@ -73,6 +73,53 @@ If certain information is not visible or unclear, use null for those fields.
 Be conservative in your confidence score - only use high confidence (0.8+) when patterns are very clear.
 """
 
+
+
+
+# ------------------------------------------------------------------
+# Live–data prompt helpers  ⬇️  (PUT RIGHT AFTER _detect_symbol_tf)
+# ------------------------------------------------------------------
+PROMPT_TEMPLATE = """
+{analysis_prompt}
+
+────────────────────────────────────────
+📈 **Live-data snapshot for {symbol} – {tf}**  
+{indicator_context}
+────────────────────────────────────────
+"""
+
+def _build_prompt(chart_b64: str,
+                  indicator_context: str,
+                  symbol: str|None,
+                  tf: str|None) -> list[dict]:
+    """Return a messages list ready for OpenAI (Vision + text)."""
+    analysis_prompt = CHART_ANALYSIS_PROMPT
+    if indicator_context:        # stitch the extra section in
+        analysis_prompt = PROMPT_TEMPLATE.format(
+            analysis_prompt=CHART_ANALYSIS_PROMPT.strip(),
+            symbol=symbol,
+            tf=tf,
+            indicator_context=indicator_context.strip()
+        )
+
+    # ① main instructions (+ optional indicator block)
+    msgs = [ {"type":"text", "text": analysis_prompt} ]
+
+    # ② the actual image
+    msgs.append({
+        "type": "image_url",
+        "image_url": {
+            "url": f"data:image/jpeg;base64,{chart_b64}",
+            "detail": "high",
+        },
+    })
+    return msgs
+
+
+
+
+
+
 class AIAnalyzer:
     """AI-powered chart analysis using GPT-4 Vision"""
     
@@ -89,49 +136,71 @@ class AIAnalyzer:
         self.max_tokens = 1000
         self.temperature = 0.1
         
-    async def analyze_chart(self, image_path: str, user_id: int) -> Dict[str, Any]:
+
+         # ──────────────────────────────────────────────────────────────
+    async def analyze_chart(
+        self,
+        img_path: Union[str, Path],
+        max_retries: int = 3,
+    ) -> dict:
         """
-        Analyze a chart image and return structured analysis
-        
-        Args:
-            image_path: Path to the image file
-            user_id: Telegram user ID for tracking
-            
-        Returns:
-            Dictionary containing analysis results
+        Main entry point the bot calls.
+
+        * Validates / base64-encodes the image.
+        * (Optionally) fetches live OHLCV & indicator snapshot.
+        * Builds the prompt and calls OpenAI with retry & back-off.
+        * Returns a dict  {success, content, usage}
         """
+        img_path = Path(img_path)
         start_time = datetime.now()
-        
-        try:
-            if not self.client:
-                return self._get_no_api_key_response()
-            
-            logger.info(f"🤖 Starting chart analysis for user {user_id}")
-            
-            # Prepare image for analysis
-            base64_image = await self._prepare_image(image_path)
-            if not base64_image:
-                return self._get_error_response("Failed to prepare image")
-            
-            # Call OpenAI API
-            analysis_result = await self._call_openai_api(base64_image)
-            
-            # Process and validate response
-            processed_result = await self._process_analysis_result(analysis_result)
-            
-            # Calculate processing time
-            processing_time = (datetime.now() - start_time).total_seconds()
-            processed_result['processing_time'] = processing_time
-            
-            logger.info(f"✅ Chart analysis completed for user {user_id} in {processing_time:.2f}s")
-            
-            return processed_result
-            
-        except Exception as e:
-            logger.error(f"❌ Chart analysis failed for user {user_id}: {str(e)}")
-            processing_time = (datetime.now() - start_time).total_seconds()
-            
-            return self._get_error_response(str(e), processing_time)
+        base_delay = 1.5  # s  exponential back-off
+
+        # 1)  image → base64
+        with img_path.open("rb") as f:
+            b64_img = base64.b64encode(f.read()).decode()
+
+        # 2)  attach live market context (non-fatal)
+        symbol_tf = _detect_symbol_tf(img_path)
+        indicator_section = ""
+        if symbol_tf:
+            sym, tf = symbol_tf
+            try:
+                df = fetch_ohlcv(sym, tf)            # bot.utils.data_fetcher
+                indicator_section = build_indicator_snapshot(df)  # bot.utils.tech_indicators
+                logger.info("📊 Indicators added | %s %s | rows=%d", sym, tf, len(df))
+            except Exception as e:                    # noqa: BLE001
+                logger.warning("⚠️  Live data unavailable: %s", e)
+
+        # 3)  build the prompt
+        prompt = PROMPT_TEMPLATE.format(
+            chart_b64=b64_img,
+            indicator_context=indicator_section or "No live data available.",
+        )
+
+        # 4)  call OpenAI with retries
+        for attempt in range(max_retries):
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                    response_format={"type": "json_object"},
+                )
+                logger.info("✅ OpenAI completed in %.2fs", (datetime.now() - start_time).total_seconds())
+                return {
+                    "success": True,
+                    "content": response.choices[0].message.content,
+                    "usage": response.usage.model_dump() if response.usage else None,
+                }
+
+            except Exception as e:
+                logger.warning("⏳ OpenAI attempt %d failed: %s", attempt + 1, e)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(base_delay * (2 ** attempt))
+                else:
+                    raise
+   
     
     async def _prepare_image(self, image_path: str) -> Optional[str]:
         """Prepare image for OpenAI API by encoding to base64"""
@@ -146,57 +215,8 @@ class AIAnalyzer:
             logger.error(f"❌ Error preparing image: {str(e)}")
             return None
     
-    async def _call_openai_api(self, base64_image: str) -> Dict[str, Any]:
-        """Call OpenAI API with retry logic"""
-        max_retries = 3
-        base_delay = 1.0
-        
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"🔄 Calling OpenAI API (attempt {attempt + 1})")
-                
-                response = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": CHART_ANALYSIS_PROMPT
-                                },
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{base64_image}",
-                                        "detail": "high"
-                                    }
-                                }
-                            ]
-                        }
-                    ],
-                    max_tokens=self.max_tokens,
-                    temperature=self.temperature,
-                    response_format={"type": "json_object"}
-                )
-                
-                logger.info("✅ OpenAI API call successful")
-                
-                return {
-                    'success': True,
-                    'content': response.choices[0].message.content,
-                    'usage': response.usage.model_dump() if response.usage else None
-                }
-                
-            except Exception as e:
-                logger.warning(f"⚠️ OpenAI API attempt {attempt + 1} failed: {str(e)}")
-                
-                if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)
-                    await asyncio.sleep(delay)
-                else:
-                    raise
     
+
     async def _process_analysis_result(self, api_result: Dict[str, Any]) -> Dict[str, Any]:
         """Process and validate OpenAI API response"""
         try:

@@ -51,6 +51,7 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - FINNHUB_API_KEY=${FINNHUB_API_KEY}      # ← NEW (required by data_fetcher.py)
+      - LOG_LEVEL=INFO
     volumes:
       - ./uploads:/app/uploads
       - ./logs:/app/logs
@@ -63,6 +64,13 @@ services:
           cpus: "0.75"
     env_file:
       - .env
+    # cap Docker’s own log file to 10 MB × 3 files
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 
 volumes:
   redis_data:
